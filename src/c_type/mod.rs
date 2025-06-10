@@ -31,7 +31,10 @@ pub struct Args {
 
         #[arg(long, help = "Write JSON output to a file")]
         pub output: Option<String>,
-}
+
+        #[arg(long)]
+        pub summary: bool,
+    }
 
 #[derive(Serialize)]
 #[derive(Clone)]

@@ -1,6 +1,7 @@
 use crate::c_type::{Args, LogRecord};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use regex::Regex;
@@ -23,8 +24,11 @@ pub fn filter_by_input(args: Args, file: File) {
     
         let seen_hashes = Arc::new(Mutex::new(HashSet::new()));
         let json_records = Arc::new(Mutex::new(Vec::new()));
-        let lines: Vec<String> = reader.lines().flatten().collect(); // collect first
-
+        let lines: Vec<String> = reader.lines().flatten().collect();
+        let total_lines_read = lines.len();
+        let kept_lines = Arc::new(AtomicUsize::new(0));
+        let tmp_kept_lines = Arc::new(AtomicUsize::new(0));
+ 
         lines.into_par_iter().for_each(|line| {
                 let is_match = match (&args.filter, &regex) {
                     (Some(filter), _) if line.contains(filter) => true,
@@ -34,6 +38,7 @@ pub fn filter_by_input(args: Args, file: File) {
             
                 if is_match {
                     // Deduplication
+                    tmp_kept_lines.fetch_add(1, Ordering::Relaxed);
                     if args.dedup {
                         let mut hasher = Sha256::new();
                         hasher.update(line.as_bytes());
@@ -45,7 +50,9 @@ pub fn filter_by_input(args: Args, file: File) {
                         }
                         hashes.insert(hash_hex);
                     }
-            
+
+                    kept_lines.fetch_add(1, Ordering::Relaxed);
+
                     // Output
                     if args.json {
                         if let Some(record) = parse_log_line(&line) {
@@ -68,33 +75,44 @@ pub fn filter_by_input(args: Args, file: File) {
             if let Some(output_file) = args.output {
                 match File::create(&output_file) {
                     Ok(mut file) => {
-                        let records = Arc::try_unwrap(json_records)
-                            .unwrap_or_else(|arc| (*arc.lock().unwrap()).clone().into());
-        
-                        if let Ok(json_string) = serde_json::to_string_pretty(&records) {
+                        if let Ok(records) = json_records.lock() {
+                            let json_string = serde_json::to_string_pretty(&*records)
+                                .unwrap_or_else(|_| "[]".to_string());
                             if let Err(e) = file.write_all(json_string.as_bytes()) {
-                                eprintln!("❌ Failed to write to file: {}", e);
-                            } else {
-                                println!("✅ Output written to {}", output_file);
+                                eprintln!("Failed to write to file: {}", e);
                             }
-                        } else {
-                            eprintln!("❌ Failed to serialize JSON");
                         }
                     }
-                    Err(e) => eprintln!("❌ Failed to create file: {}", e),
+                    Err(e) => eprintln!("Failed to create file: {}", e),
+                }
+            }
+
+            if args.summary {
+                println!("- Total lines read: {}", total_lines_read);
+                println!("- Lines kept after filtering{}: {}",
+                  if args.dedup { " & deduplication" } else { "" },
+                    kept_lines.load(Ordering::Relaxed)
+                );
+                if args.dedup {
+                    let int_kept_lines = tmp_kept_lines.load(Ordering::Relaxed);
+                    let dedup_length = seen_hashes.lock().unwrap().len();
+                    println!("- Total duplicates: {}", int_kept_lines - dedup_length);
                 }
             }
     }
 
+    
+
+static LIST_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"([a-zA-Z0-9._-]+)\[\d+\]:").expect("Invalid regex pattern")
+});
 
 pub fn list_services(reader: BufReader<File>) {
         
         let lines: Vec<String> = reader.lines().flatten().collect();
-        // Regex to extract: "service[pid]:"
-        let re = Regex::new(r"([a-zA-Z0-9._-]+)\[\d+\]:").unwrap();
-    
+        // Regex to extract: "service[pid]:"    
         let services: HashSet<String> = lines.par_iter().filter_map(|line| {
-                re.captures(line).map(|cap| {cap[1].to_string()})
+                LIST_REGEX.captures(line).map(|cap| {cap[1].to_string()})
         }).collect();
     
         let mut sorted: Vec<_> = services.into_iter().collect();
