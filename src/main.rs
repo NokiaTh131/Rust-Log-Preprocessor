@@ -12,5 +12,5 @@ fn main() {
     let start = Instant::now();
     filter::filter_by_input(args, file);
     let duration = start.elapsed();
-    println!("filter_by_input took: {:?}", duration);
+    println!("took: {:?}", duration);
 }
